@@ -1,4 +1,4 @@
 # recommendation_sys
 
 ### 🚀 Live Demo
-👉 [Open Recommender App on Streamlit]([https://hayagreevan-k-product-recommender.streamlit.app])
+👉 [Open Recommender App on Streamlit] https://lsvwykxlplc5jnjiqbik4w.streamlit.app/
