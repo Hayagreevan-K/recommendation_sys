@@ -1,116 +1,224 @@
-
----
-
-## 💻 **4️⃣ Final `app.py` (Production-Ready)**
-
-This version uses only your small, compressed artifacts.  
-It auto-loads `.ann.gz` and handles missing optional files gracefully.
-
-```python
+# app.py — Streamlit recommender (artifacts in same folder)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
 import os
 import gzip, shutil
-from annoy import AnnoyIndex
+from pathlib import Path
 
-st.set_page_config(page_title="🛍️ Product Recommender", layout="wide")
+st.set_page_config(page_title="Product Recommender", layout="wide")
 
-# ---------- Load artifacts ----------
 @st.cache_resource
-def load_models():
-    base = "models"
-    models = {}
+def load_artifacts():
+    root = Path(".")
+    artifacts = {}
 
-    def load_joblib(path):
-        full = os.path.join(base, path)
-        if os.path.exists(full):
-            return joblib.load(full)
+    # --- product_meta ---
+    pm_path = root / "product_meta_small.joblib"
+    pm_pickle = root / "product_meta_small.pkl"
+    if pm_path.exists():
+        try:
+            pm = joblib.load(pm_path)
+            # joblib may return a DataFrame or a dict-like
+            if isinstance(pm, pd.DataFrame):
+                artifacts["product_meta"] = pm
+            else:
+                # try convert to DataFrame
+                try:
+                    artifacts["product_meta"] = pd.DataFrame(pm)
+                except Exception:
+                    artifacts["product_meta"] = None
+        except Exception:
+            artifacts["product_meta"] = None
+    elif pm_pickle.exists():
+        try:
+            artifacts["product_meta"] = pd.read_pickle(pm_pickle)
+        except Exception:
+            artifacts["product_meta"] = None
+    else:
+        artifacts["product_meta"] = None
+
+    # --- similarity_map ---
+    sm_path = root / "similarity_map_small.joblib"
+    artifacts["similarity_map"] = joblib.load(sm_path) if sm_path.exists() else None
+
+    # --- tfidf ---
+    tf_path = root / "tfidf_vectorizer.joblib"
+    artifacts["tfidf"] = joblib.load(tf_path) if tf_path.exists() else None
+
+    # --- svd_model_small (to infer annoy dim) ---
+    svd_path = root / "svd_model_small.joblib"
+    svd_obj = None
+    if svd_path.exists():
+        try:
+            svd_job = joblib.load(svd_path)
+            # earlier code saved dict {'svd': svd_small} sometimes
+            if isinstance(svd_job, dict) and 'svd' in svd_job:
+                svd_obj = svd_job['svd']
+            else:
+                svd_obj = svd_job
+        except Exception:
+            svd_obj = None
+    artifacts["svd_model"] = svd_obj
+
+    # --- Annoy: decompress if needed then load path (we'll lazily load Annoy index) ---
+    ann_gz = root / "annoy_index_small.ann.gz"
+    ann_file = root / "annoy_index_small.ann"
+    if ann_gz.exists() and not ann_file.exists():
+        try:
+            with gzip.open(ann_gz, "rb") as f_in, open(ann_file, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            artifacts["annoy_decompressed"] = True
+        except Exception:
+            artifacts["annoy_decompressed"] = False
+    artifacts["annoy_path"] = str(ann_file) if ann_file.exists() else None
+
+    return artifacts
+
+art = load_artifacts()
+product_meta = art.get("product_meta")
+similarity_map = art.get("similarity_map")
+tfidf_vec = art.get("tfidf")
+svd_model = art.get("svd_model")
+annoy_path = art.get("annoy_path")
+
+# Annoy will be loaded lazily only if needed
+_annoy_index = None
+def load_annoy_index():
+    global _annoy_index
+    if _annoy_index is not None:
+        return _annoy_index
+    if annoy_path is None:
         return None
-
-    # decompress annoy if gzipped
-    ann_path = os.path.join(base, "annoy_index_small.ann")
-    ann_gz = ann_path + ".gz"
-    if not os.path.exists(ann_path) and os.path.exists(ann_gz):
-        with gzip.open(ann_gz, "rb") as f_in, open(ann_path, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
-        st.info("Decompressed annoy_index_small.ann.gz ✅")
-
-    models["product_meta"] = load_joblib("product_meta_small.joblib")
-    models["similarity_map"] = load_joblib("similarity_map_small.joblib")
-    models["svd_model"] = load_joblib("svd_model_small.joblib")
-    models["tfidf"] = load_joblib("tfidf_vectorizer.joblib")
-
+    try:
+        from annoy import AnnoyIndex
+    except Exception:
+        return None
+    # infer dim from svd_model if available
     dim = 32
-    ann = AnnoyIndex(dim, metric="angular")
-    ann.load(ann_path)
-    models["annoy"] = ann
+    if svd_model is not None and hasattr(svd_model, "n_components"):
+        dim = int(svd_model.n_components)
+    ai = AnnoyIndex(dim, metric="angular")
+    ai.load(annoy_path)
+    _annoy_index = ai
+    return _annoy_index
 
-    return models
+# --- Basic checks ---
+st.title("🛍️ Product Recommender")
+st.markdown("Lightweight content-based recommendations. Uses `similarity_map_small.joblib` if present, otherwise Annoy index.")
 
-art = load_models()
-meta = art["product_meta"]
-ann = art["annoy"]
-similarity_map = art["similarity_map"]
-
-# ---------- UI ----------
-st.title("🛍️ Product Recommender System")
-st.markdown("Hybrid (Content + Collaborative) recommendations using TF-IDF, SVD, and Annoy.")
-
-if meta is None:
-    st.error("❌ product_meta_small.joblib not found in `models/`.")
+if product_meta is None:
+    st.error("product_meta_small.joblib (or product_meta_small.pkl) not found in repository root. Please add it.")
     st.stop()
 
-product_ids = meta["product_id"].astype(str).tolist()
-prod_to_idx = {p: i for i, p in enumerate(product_ids)}
+# Ensure product_meta columns exist
+if 'product_id' not in product_meta.columns:
+    product_meta['product_id'] = product_meta.index.astype(str)
+if 'title' not in product_meta.columns:
+    product_meta['title'] = product_meta['product_id'].astype(str)
+
+product_meta['product_id'] = product_meta['product_id'].astype(str)
+product_ids = product_meta['product_id'].tolist()
+prod_to_idx = {p: i for i,p in enumerate(product_ids)}
 
 def get_title(pid):
-    row = meta.loc[meta["product_id"].astype(str) == str(pid)]
-    return row["title"].iloc[0] if not row.empty else pid
+    row = product_meta.loc[product_meta['product_id'] == str(pid)]
+    return row['title'].iloc[0] if not row.empty else str(pid)
 
-# ---------- Functions ----------
-def get_similar(pid, top_k=5):
+# Try to detect an image column for nicer UI
+image_col = None
+for c in ['image','img','thumbnail','url','link']:
+    if c in product_meta.columns:
+        image_col = c
+        break
+
+# --- recommendation helpers ---
+def similar_by_map(pid, k=5):
     pid = str(pid)
-    if similarity_map and pid in similarity_map:
-        return similarity_map[pid][:top_k]
-    idx = prod_to_idx.get(pid)
+    if similarity_map is None:
+        return None
+    return similarity_map.get(pid, [])[:k]
+
+def similar_by_annoy(pid, k=5):
+    ai = load_annoy_index()
+    if ai is None:
+        return None
+    idx = prod_to_idx.get(str(pid))
     if idx is None:
         return []
-    nn = ann.get_nns_by_item(idx, top_k + 1)
-    nn = [product_ids[i] for i in nn if product_ids[i] != pid][:top_k]
-    return nn
+    nbrs = ai.get_nns_by_item(idx, k+1, include_distances=False)
+    # exclude self
+    nbrs = [product_ids[i] for i in nbrs if product_ids[i] != pid][:k]
+    return nbrs
 
-# ---------- Sidebar ----------
-st.sidebar.header("🔍 Search & Options")
-search_query = st.sidebar.text_input("Search Product", "")
-k = st.sidebar.slider("Number of Recommendations", 3, 15, 5)
+def get_similar(pid, k=5):
+    # prefer similarity_map (small & exact), else use annoy
+    res = similar_by_map(pid, k)
+    if res is not None:
+        return res
+    return similar_by_annoy(pid, k) or []
 
-# ---------- Search ----------
-if search_query:
-    mask = meta["title"].str.contains(search_query, case=False, na=False)
-    matches = meta[mask].head(30)
+# --- Sidebar UI ---
+with st.sidebar:
+    st.header("Query")
+    query = st.text_input("Search product title", "")
+    top_k = st.slider("Number of similar products", 1, 20, 6)
+    show_meta = st.checkbox("Show metadata (IDs, etc.)", value=False)
+
+# --- center UI: product search / selection ---
+st.subheader("Select a product to get similar items")
+
+selected_pid = None
+if query.strip():
+    mask = product_meta['title'].str.contains(query, case=False, na=False)
+    matches = product_meta[mask].head(100)
     if matches.empty:
-        st.warning("No products found for that search.")
-        st.stop()
-    selected_pid = st.selectbox("Select Product", matches["product_id"], format_func=get_title)
+        st.warning("No matching products found for that query.")
+    else:
+        opts = matches['product_id'].tolist()
+        selected_pid = st.selectbox("Choose product", options=opts, format_func=get_title)
 else:
-    selected_pid = st.selectbox("Select Product", meta["product_id"].head(30), format_func=get_title)
+    # show a few popular / top rows
+    st.info("No search query — choose from top products")
+    default_options = product_meta.head(100)['product_id'].tolist()
+    selected_pid = st.selectbox("Choose product", default_options, format_func=get_title)
 
-# ---------- Recommendations ----------
+if selected_pid:
+    st.markdown("### Selected")
+    sel_row = product_meta[product_meta['product_id'] == str(selected_pid)].iloc[0]
+    st.markdown(f"**{get_title(selected_pid)}**")
+    if image_col and pd.notna(sel_row.get(image_col)):
+        try:
+            st.image(sel_row.get(image_col), width=240)
+        except Exception:
+            pass
+    if show_meta:
+        st.write(sel_row.to_dict())
+
+    st.markdown("---")
+    st.subheader("Similar products")
+    recs = get_similar(selected_pid, k=top_k)
+    if not recs:
+        st.info("No similar products found (similarity_map missing and annoy not available).")
+    else:
+        # display grid of results
+        cols = st.columns(2 if top_k <= 4 else 3)
+        for i, pid in enumerate(recs):
+            c = cols[i % len(cols)]
+            with c:
+                st.markdown(f"**{i+1}. {get_title(pid)}**")
+                if image_col:
+                    row = product_meta.loc[product_meta['product_id'] == pid]
+                    if not row.empty and pd.notna(row.iloc[0].get(image_col)):
+                        try:
+                            st.image(row.iloc[0].get(image_col), width=200)
+                        except Exception:
+                            pass
+                if show_meta:
+                    row = product_meta.loc[product_meta['product_id'] == pid]
+                    if not row.empty:
+                        st.write(row.iloc[0].to_dict())
+
 st.markdown("---")
-st.subheader("🎯 Recommended Products")
-
-recs = get_similar(selected_pid, top_k=k)
-if not recs:
-    st.warning("No similar items found.")
-else:
-    cols = st.columns(2)
-    for i, pid in enumerate(recs):
-        col = cols[i % 2]
-        with col:
-            st.markdown(f"**{i+1}. {get_title(pid)}**")
-            st.caption(f"Product ID: {pid}")
-st.markdown("---")
-
-st.caption("Model artifacts loaded successfully ✅")
+st.caption("Artifacts loaded from repository root. If you want collaborative/hybrid features, add a `svd_factors.joblib` or `interactions.csv`.")
